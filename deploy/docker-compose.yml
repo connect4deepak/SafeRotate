@@ -1,0 +1,75 @@
+# Local SafeRotate demo: Postgres, two demo apps under load, Prometheus,
+# and the saferotate CLI. All credentials here are demo-only.
+name: saferotate-demo
+
+x-app: &app
+  build: { context: .., dockerfile: Dockerfile }
+  image: saferotate:dev
+  command: demoapp
+  volumes: ["secrets:/secrets:ro"]
+  depends_on:
+    secrets-init: { condition: service_completed_successfully }
+    postgres: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_PASSWORD: postgres-demo-pw
+    volumes: ["./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "demo"]
+      interval: 1s
+      retries: 30
+
+  # Writes the initial credential the apps start with (role app_blue).
+  secrets-init:
+    image: alpine:3.20
+    volumes: ["secrets:/secrets", "evidence:/evidence"]
+    command: >
+      sh -c 'test -f /secrets/db.json ||
+      echo "{\"username\":\"app_blue\",\"password\":\"blue-initial-demo-pw\"}" > /secrets/db.json;
+      chown 10001 /secrets /secrets/db.json /evidence'
+
+  app1:
+    <<: *app
+    environment: { APP_NAME: app1 }
+  app2:
+    <<: *app
+    environment: { APP_NAME: app2 }
+  # An app that never reloads its secret. Start it with --profile stale to see
+  # the verifier block the revoke and roll back.
+  app-stale:
+    <<: *app
+    profiles: [stale]
+    environment: { APP_NAME: app-stale, RELOAD: "false" }
+
+  loadgen:
+    image: saferotate:dev
+    command: loadgen
+    environment: { RPS: "50", TARGETS: "http://app1:8080/,http://app2:8080/" }
+    ports: ["8090:8090"]
+    depends_on: [app1, app2]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  # The CLI. Run with: docker compose run --rm saferotate <command>
+  saferotate:
+    image: saferotate:dev
+    profiles: [tools]
+    entrypoint: ["saferotate"]
+    user: "10001"
+    environment:
+      SAFEROTATE_DB_URL: postgres://saferotate:saferotate-demo-pw@postgres/demo?sslmode=disable
+      SAFEROTATE_FINGERPRINT_KEY: demo-fingerprint-key
+      SAFEROTATE_LEDGER: /evidence/ledger.jsonl
+      SAFEROTATE_PROMETHEUS_URL: http://prometheus:9090
+    volumes: ["secrets:/secrets", "evidence:/evidence"]
+
+volumes:
+  secrets:
+  evidence:
